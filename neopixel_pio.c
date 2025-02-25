@@ -20,7 +20,7 @@
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define MICROPHONE_PIN 28
-#define NOISE_THRESHOLD 3000
+#define NOISE_THRESHOLD 2500
 #define BUZZER_HIGH_PIN 21    // GPIO 21 - PWM Slice 10
 #define BUZZER_LOW_PIN 10     // GPIO 10 - PWM Slice 5
 #define BUZZER_HIGH_FREQ 2000 // 2 kHz
@@ -31,8 +31,16 @@
 #define I2C_SDA 14
 #define I2C_SCL 15
 
-// Buffer para o display SSD1306 (128x64 pixels)
-uint8_t ssd1306_buffer[OLED_WIDTH * OLED_HEIGHT / 8]; // 1024 bytes
+// Estrutura para área de renderização
+struct render_area frame_area = {
+    .start_column = 0,
+    .end_column = ssd1306_width - 1,
+    .start_page = 0,
+    .end_page = ssd1306_n_pages - 1
+};
+
+// Buffer para o display SSD1306
+uint8_t ssd1306_buffer[ssd1306_buffer_length];
 
 // =====================
 // DEFINIÇÕES DE TIPOS
@@ -62,7 +70,7 @@ typedef struct {
     Button btn_reset;
     bool alarm_active;
     bool needs_display_update;
-    char display_message[64]; // Mensagem atual no display
+    char display_message[64];
 } AlarmSystem;
 
 // =====================
@@ -106,70 +114,52 @@ void buzzer_init(uint pin, uint freq) {
     uint slice_num = pwm_gpio_to_slice_num(pin);
     pwm_config config = pwm_get_default_config();
     
-    // Configuração do PWM para a frequência desejada
-    float divider = (float)clock_get_hz(clk_sys) / (freq * 256); // Wrap de 255 (256 ciclos)
+    float divider = (float)clock_get_hz(clk_sys) / (freq * 256);
     pwm_config_set_clkdiv(&config, divider);
     pwm_config_set_wrap(&config, 255);
     pwm_init(slice_num, &config, true);
-    
-    // Inicializa desligado
     pwm_set_chan_level(slice_num, pwm_gpio_to_channel(pin), 0);
 }
 
 void buzzer_on(uint pin) {
     uint slice_num = pwm_gpio_to_slice_num(pin);
     uint channel = pwm_gpio_to_channel(pin);
-    pwm_set_chan_level(slice_num, channel, 128); // 50% duty cycle
+    pwm_set_chan_level(slice_num, channel, 128);
 }
 
 void buzzer_off(uint pin) {
     uint slice_num = pwm_gpio_to_slice_num(pin);
     uint channel = pwm_gpio_to_channel(pin);
-    pwm_set_chan_level(slice_num, channel, 0); // 0% duty cycle
+    pwm_set_chan_level(slice_num, channel, 0);
 }
 
 void buzzer_siren() {
     static bool siren_state = false;
     siren_state = !siren_state;
-
-    if (siren_state) {
-        buzzer_on(BUZZER_HIGH_PIN);
-        buzzer_off(BUZZER_LOW_PIN);
-    } else {
-        buzzer_off(BUZZER_HIGH_PIN);
-        buzzer_on(BUZZER_LOW_PIN);
-    }
+    siren_state ? buzzer_on(BUZZER_HIGH_PIN) : buzzer_on(BUZZER_LOW_PIN);
+    siren_state ? buzzer_off(BUZZER_LOW_PIN) : buzzer_off(BUZZER_HIGH_PIN);
 }
 
 // =====================
-// DISPLAY OLED
+// DISPLAY OLED 
 // =====================
 void display_init() {
-    i2c_init(i2c1, 400 * 1000);
+    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
     ssd1306_init();
-    memset(ssd1306_buffer, 0, sizeof(ssd1306_buffer));
+    
+    calculate_render_area_buffer_length(&frame_area);
+    memset(ssd1306_buffer, 0, ssd1306_buffer_length);
+    render_on_display(ssd1306_buffer, &frame_area);
 }
 
 void display_update(const char *msg) {
-    memset(ssd1306_buffer, 0, sizeof(ssd1306_buffer)); // Limpa o buffer
-    ssd1306_draw_string(ssd1306_buffer, 0, 0, msg);   // Desenha a string no buffer
-    render_on_display(ssd1306_buffer, NULL);          // Renderiza o buffer no display
-}
-
-void display_scroll_text(const char *msg, uint8_t line, uint8_t speed_ms) {
-    uint8_t len = strlen(msg);
-    uint8_t pos = 0;
-    while (pos < len) {
-        memset(ssd1306_buffer, 0, sizeof(ssd1306_buffer)); // Limpa o buffer
-        ssd1306_draw_string(ssd1306_buffer, 0, line, &msg[pos]); // Desenha a string
-        render_on_display(ssd1306_buffer, NULL);          // Renderiza o buffer
-        sleep_ms(speed_ms);
-        pos++;
-    }
+    memset(ssd1306_buffer, 0, ssd1306_buffer_length);
+    ssd1306_draw_string(ssd1306_buffer, 0, 0, msg);
+    render_on_display(ssd1306_buffer, &frame_area);
 }
 
 // =====================
@@ -202,21 +192,16 @@ void detect_noise() {
 void system_init() {
     stdio_init_all();
 
-    // Inicialização do ADC
     adc_init();
     adc_gpio_init(MICROPHONE_PIN);
 
-    // Inicialização LED Matrix
     ledmatrix_init(&alarm_system.matrix, LED_MATRIX_PIN);
 
-    // Inicialização dos Buzzers com PWM
     buzzer_init(BUZZER_HIGH_PIN, BUZZER_HIGH_FREQ);
     buzzer_init(BUZZER_LOW_PIN, BUZZER_LOW_FREQ);
 
-    // Inicialização Display
     display_init();
 
-    // Configuração Botões
     gpio_init(BUTTON_EMERGENCY);
     gpio_set_dir(BUTTON_EMERGENCY, GPIO_IN);
     gpio_pull_up(BUTTON_EMERGENCY);
@@ -227,7 +212,6 @@ void system_init() {
     gpio_pull_up(BUTTON_RESET);
     gpio_set_irq_enabled_with_callback(BUTTON_RESET, GPIO_IRQ_EDGE_FALL, true, &button_isr);
 
-    // Estado Inicial
     alarm_system.alarm_active = false;
     alarm_system.needs_display_update = true;
     strcpy(alarm_system.display_message, "Sistema Pronto");
@@ -244,7 +228,6 @@ int main() {
     npLED_t off = {0};
 
     while (true) {
-        // Atualização periódica do display
         if (absolute_time_diff_us(last_update, get_absolute_time()) > 100000) {
             if (alarm_system.needs_display_update) {
                 display_update(alarm_system.alarm_active ? "ALARME ATIVADO!" : "Sistema Pronto");
@@ -253,7 +236,6 @@ int main() {
             last_update = get_absolute_time();
         }
 
-        // Tratamento de eventos dos botões
         if (alarm_system.btn_emergency.pressed) {
             alarm_system.alarm_active = true;
             alarm_system.btn_emergency.pressed = false;
@@ -268,10 +250,8 @@ int main() {
             alarm_system.needs_display_update = true;
         }
 
-        // Detecção de ruído
         detect_noise();
 
-        // Controle do alarme com piscagem do X
         if (alarm_system.alarm_active) {
             static absolute_time_t last_toggle;
             static bool blink_state = false;
@@ -280,13 +260,10 @@ int main() {
                 last_toggle = get_absolute_time();
                 blink_state = !blink_state;
                 
-                if (blink_state) {
-                    ledmatrix_show_pattern(&alarm_system.matrix, &red);
-                } else {
-                    ledmatrix_show_pattern(&alarm_system.matrix, &off);
-                }
+                blink_state ? ledmatrix_show_pattern(&alarm_system.matrix, &red) : 
+                            ledmatrix_show_pattern(&alarm_system.matrix, &off);
                 
-                buzzer_siren(); // Mantém a sirene sincronizada com a piscada
+                buzzer_siren();
             }
         }
 
